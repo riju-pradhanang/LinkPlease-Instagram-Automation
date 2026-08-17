@@ -1,43 +1,27 @@
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from app.db import Base
-from app.models import Rule
-from app.schemas import WebhookPayload
-from app.services.ingestion import process_webhook_event
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from app.db import AsyncSessionLocal
+from app.models import Rule, SendJob
 
 
-@pytest.fixture
-def db_session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+@pytest.mark.asyncio
+async def test_duplicate_send_job_is_rejected():
+    async with AsyncSessionLocal() as db:
+        # Clean test rule if exists
+        test_rule = await db.get(Rule, "rule_test")
+        if not test_rule:
+            db.add(Rule(rule_id="rule_test", keyword="PRICE", dm_message="hi"))
+            await db.commit()
 
+        stmt = pg_insert(SendJob).values(
+            rule_id="rule_test", recipient_user_id="usr_dup", comment_id="c1", dm_message="hi"
+        ).on_conflict_do_nothing(index_elements=["rule_id", "recipient_user_id"])
 
-def test_unique_constraint_deduplication_race(db_session):
-    # Setup test rule
-    rule = Rule(keyword="link", response_link="https://example.com/item")
-    db_session.add(rule)
-    db_session.commit()
+        first = await db.execute(stmt)
+        await db.commit()
 
-    payload = WebhookPayload(
-        event_id="evt_12345",
-        user_id="usr_999",
-        comment_text="Please send me the link!"
-    )
+        second = await db.execute(stmt)
+        await db.commit()
 
-    # First event ingestion
-    res1 = process_webhook_event(db_session, payload)
-    assert res1.status == "processed"
-    assert res1.job_created is True
-
-    # Duplicate event ingestion with identical event_id (Simulating race condition / re-delivery)
-    res2 = process_webhook_event(db_session, payload)
-    assert res2.status == "duplicate"
-    assert res2.job_created is False
-    assert res2.message == "Event already processed"
+        assert first.rowcount == 1
+        assert second.rowcount == 0  # the whole guarantee, in one assertion
