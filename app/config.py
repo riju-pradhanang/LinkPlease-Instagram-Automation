@@ -1,16 +1,11 @@
-from pydantic_settings import BaseSettings
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
-class Settings(BaseSettings):
-    database_url: str = "sqlite:///./linkplease.db"
-    app_name: str = "linkplease"
-    debug: bool = True
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
-
-
-settings = Settings()
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:devpass@localhost:5432/linkplease",
+)
+PSEUDOGRAM_API_KEY = os.environ["PSEUDOGRAM_API_KEY"]
+PSEUDOGRAM_BASE_URL = "https://pseudogram-api.onrender.com"
