@@ -1,26 +1,23 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
-from app.models import WebhookEvent, Rule, SendJob
+from app.models import SendJob, StatsCounter
 from app.schemas import StatsResponse
 
-router = APIRouter(prefix="/stats", tags=["stats"])
+router = APIRouter()
 
 
-@router.get("", response_model=StatsResponse)
-def get_stats(db: Session = Depends(get_db)):
-    total_events = db.query(WebhookEvent).count()
-    total_rules = db.query(Rule).count()
-    total_jobs = db.query(SendJob).count()
-    pending_jobs = db.query(SendJob).filter(SendJob.status == "PENDING").count()
-    successful_jobs = db.query(SendJob).filter(SendJob.status == "SUCCESS").count()
-    failed_jobs = db.query(SendJob).filter(SendJob.status == "FAILED").count()
-
-    return StatsResponse(
-        total_events=total_events,
-        total_rules=total_rules,
-        total_jobs=total_jobs,
-        pending_jobs=pending_jobs,
-        successful_jobs=successful_jobs,
-        failed_jobs=failed_jobs
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(
+            func.count().filter(SendJob.status == "delivered"),
+            func.count().filter(SendJob.status == "failed"),
+            func.count().filter(SendJob.status.in_(["pending", "sending", "queued"])),
+        )
     )
+    sent, failed, queued = result.one()
+    counter = (await db.execute(select(StatsCounter))).scalars().first()
+    duplicates_blocked = counter.duplicates_blocked if counter else 0
+    return StatsResponse(sent=sent, failed=failed, queued=queued, duplicates_blocked=duplicates_blocked)
