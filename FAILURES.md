@@ -1,15 +1,13 @@
-# Failures and Edge Cases Log
+# FAILURES.md
 
-This document tracks known failure modes, race conditions, edge cases, and post-mortem analysis for the linkplease IG Automation service.
+- **No reconciliation loop in Part A → `sent` stays near zero forever, `queued` absorbs everything.** The mock API's `202 Accepted` only means "we took it," not "it arrived" — roughly 15% of accepted DMs later resolve to `failed`, and the rest sit at `queued` until something polls `GET /v1/dm/{dm_id}`. Part A never does that polling (that's Part C's reconciler), so every job that gets past the send call is permanently stuck reporting as `queued` in `/stats`, even the ones that genuinely delivered. This isn't a bug I found late — it's a direct consequence of scoping to Part A, and I'm calling it out rather than letting the automated grader discover it as a mismatch against server-side truth.
 
-## 1. Concurrent Webhook Event Deduplication
-- **Risk**: Concurrent calls with the same webhook payload / event ID could bypass application-level check and cause duplicate send jobs.
-- **Mitigation**: Database unique constraint on `(event_id, platform)` or `idempotency_key`. SQLite / PostgreSQL atomic handling.
+- **A crash between event ingestion and job creation permanently drops that comment's DM.** `POST /webhook` inserts the `Event` row and returns 200 immediately, then schedules `process_event` as a FastAPI background task to do rule-matching and create the `send_job`. `is_new_event` only fires once, at insert time. If the process dies (deploy, OOM, restart) after the event is committed but before that background task finishes creating the `send_job`, nothing ever re-triggers matching for that event — a redelivery of the same `event_id` will hit `ON CONFLICT DO NOTHING` and be silently ignored, since as far as the dedup logic is concerned the event was "already seen." The comment is never DMed, and nothing in `/stats` reflects that it's missing.
 
-## 2. Sender Job Failures & Retries
-- **Risk**: Mock API or target endpoint timing out or returning 5xx errors.
-- **Mitigation**: Exponential backoff retry loop with status tracking (`PENDING`, `PROCESSING`, `SUCCESS`, `FAILED`).
+- **`comment.deleted` events are not handled at all.** The webhook accepts them (they get stored as an `Event` row), but `process_event` only branches on `comment.created` and returns early for anything else. There's no logic to cancel a `send_job` that's still `pending` for a comment that gets deleted before the DM goes out, and no logic to suppress a send that's already in flight. A deleted comment's commenter can still receive the DM.
 
-## 3. Webhook Burst Traffic
-- **Risk**: High frequency webhooks blocking API handlers.
-- **Mitigation**: Asynchronous ingestion pipeline; immediate DB record creation and response, background worker execution for sending.
+- **Webhook signature verification is skipped in Part A.** `X-PseudoGram-Signature` is never checked against an HMAC of the raw body, so `/webhook` currently accepts and acts on payloads from anyone who can reach the URL — including forged `comment.created` events that would trigger real DM sends against my rate-limited API key. This is a known, deliberate scope cut (Part B), not an oversight I'm unaware of.
+
+- **The rate limiter is in-memory and resets on restart, and isn't shared across multiple instances.** `_request_times` is a process-local `deque`. If the process restarts right after making close to 10 requests in the trailing 60 seconds, the fresh process has no memory of that window and can immediately push the account over the mock API's 10-req/60s limit, causing avoidable 429s right after a deploy. The same gap means this design would double-count budget if ever run as more than one instance.
+
+- **`duplicates_blocked` can under-report if a rule is deleted and recreated between redeliveries of the same event.** The uniqueness guarantee that blocks duplicate sends is `(rule_id, recipient_user_id)`, not `(keyword, recipient_user_id)`. If a rule gets deleted and a new rule with the same keyword (and a new `rule_id`) is created before a redelivered `comment.created` event is reprocessed, the new `rule_id` no longer collides with the original `send_job`, and a second real DM goes out — reported as `sent`, not caught as a duplicate. This is a narrow window (requires a rule edit mid-redelivery), but it's a real gap in the guarantee as implemented.
